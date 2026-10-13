@@ -12,7 +12,7 @@ The scan reveals the following Python code:
 
 ```python
 print("Hello, CTF!")
-```
+``` 
 
 Alright, let’s start with some basic enumeration by running an Nmap scan against the target.
 
