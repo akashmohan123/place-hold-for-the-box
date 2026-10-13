@@ -15,5 +15,3 @@ print("Hello, CTF!")
 ## Enumeration
 
 Here is the result of the port scan.
-
-![Nmap scan results](images/enumeration.png)
